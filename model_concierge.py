@@ -1,17 +1,22 @@
-"""Model Concierge v3.17: лечит три бага выходных: (1) лоры с именами
-krea/z_image больше не притворяются DiT-ами (тензорная проверка лор — первая),
-(2) Krea2 собирается без --llm/--vae (всё встроено в чекпоинт), (3) всё из v3.16:
-имена файлов с лорами, фильтр None-триггеров, подсветка совместимости SD15/SDXL."""
+"""Model Concierge v3.27: ВСЕ КАРТИНКИ И ВИДЕО ИДУТ В output\ (отдельная папка
+D:\\AI_Servers\\sd-cpp\\output\\) — корень sd-cpp больше не замусоривается.
+img2vid и upscale корректно находят свои входы в output\\. Плюс всё из v3.26:
+ручная память Civitai через браузер, анти-залипание LLM, помощник промптов
+(🎲/✨/📝), тихий сервер, валидация wildcards, XMods-YAML, embeddings, Krea2,
+CFG турбо."""
 
 from __future__ import annotations
 
 import base64
 import json
+import random
 import re
 import struct
 import subprocess
+import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,20 +24,70 @@ from pathlib import Path
 # ==================== НАСТРОЙКИ ====================
 HOST, PORT = "127.0.0.1", 8090
 MODELS = Path(r"D:\AI_Servers\sd-cpp\models")
-SD_CLI = str(MODELS.parent / "sdc.bat") if (MODELS.parent / "sdc.bat").exists() else str(MODELS.parent / "sd-cli.exe")
-SD_CLI_RAW = str(MODELS.parent / "sd-cli.exe")
+SD_CCPP_ROOT = MODELS.parent
+OUTPUT_DIR = SD_CCPP_ROOT / "output"
+SD_CLI = str(SD_CCPP_ROOT / "sdc.bat") if (SD_CCPP_ROOT / "sdc.bat").exists() else str(SD_CCPP_ROOT / "sd-cli.exe")
+SD_CLI_RAW = str(SD_CCPP_ROOT / "sd-cli.exe")
 LLAMA_API = "http://127.0.0.1:8080/v1/chat/completions"
 VL_API = "http://127.0.0.1:8081/v1/chat/completions"
 LORA_DIR = str(MODELS / "lora")
-LOG_DIR = MODELS.parent / "queue_logs"
-QUEUE_FILE = MODELS.parent / "queue.json"
+WILDCARD_DIR = MODELS / "wildcards"
+LOG_DIR = SD_CCPP_ROOT / "queue_logs"
+QUEUE_FILE = SD_CCPP_ROOT / "queue.json"
 DEFAULT_PROMPT = "a photo of a red-haired girl sitting on the snow in a pine forest"
+
+GENRES = {
+    "portrait": {
+        "ru": "Портрет",
+        "base": "a portrait of a young woman, expressive face, detailed skin texture",
+        "mods": ["XMods/ProPhoto/Lighting", "XMods/ProPhoto/Artists",
+                 "XMods/ProPhoto/Aperture", "XMods/Helpers/begin"],
+    },
+    "landscape": {
+        "ru": "Пейзаж",
+        "base": "a breathtaking landscape, epic natural scenery, atmospheric perspective",
+        "mods": ["XMods/Helpers/begin", "XMods/ProPhoto/Lighting",
+                 "XMods/ProPhoto/PhotoTerms"],
+    },
+    "scifi": {
+        "ru": "Sci-Fi",
+        "base": "a sci-fi scene, futuristic technology, cinematic atmosphere",
+        "mods": ["XMods/SciFi/Lighting", "XMods/SciFi/Style",
+                 "XMods/SciFi/Genre", "XMods/SciFi/CyberScape",
+                 "XMods/Helpers/begin"],
+    },
+    "fantasy": {
+        "ru": "Фэнтези",
+        "base": "a fantasy scene, magical atmosphere, mythical creatures, epic lighting",
+        "mods": ["XMods/Fantasy/Lighting", "XMods/Fantasy/Effects",
+                 "XMods/Fantasy/Styles", "XMods/Helpers/begin"],
+    },
+    "horror": {
+        "ru": "Хоррор",
+        "base": "a horror scene, eerie atmosphere, unsettling mood",
+        "mods": ["XMods/Halloween/Lighting", "XMods/Halloween/Mood",
+                 "XMods/Halloween/Directors", "XMods/Halloween/Visuals",
+                 "XMods/Helpers/begin"],
+    },
+    "cyberpunk": {
+        "ru": "Киберпанк",
+        "base": "a cyberpunk scene, neon lights, rain-slicked streets, dystopian city",
+        "mods": ["XMods/SciFi/Lighting", "XMods/SciFi/CyberScape",
+                 "XMods/SciFi/CyberLights", "XMods/Helpers/begin"],
+    },
+}
 
 EXTRAS = {
     "sd15": "sharp focus, highly detailed, natural skin texture",
     "sdxl": "sharp focus, highly detailed, natural skin texture",
     "qwen": "sharp focus, highly detailed, natural skin texture",
     "zimage": "sharp focus, highly detailed, natural skin texture",
+}
+NEG = {
+    "sd15": "blurry, low quality, deformed, painting, illustration, anime, cartoon, 3d render, plastic skin",
+    "sdxl": "blurry, low quality, deformed, painting, illustration, anime, cartoon, 3d render, plastic skin",
+    "qwen": "blurry, low quality, deformed",
+    "zimage": "blurry, low quality, deformed",
 }
 TRIGGERS = [
     ("detailed perfection", "ultra detailed, detailed skin pore, sharp, realistic style"),
@@ -72,6 +127,7 @@ ROLE_RU = {
     "vae_zimage": "VAE Flux-стиль (ae.safetensors) для Z-Image",
     "animatediff_mm": "Motion-модуль AnimateDiff (видео)",
     "esrgan": "ESRGAN-апскейлер x4 (опционально, для upscale)",
+    "embedding": "Textual Inversion embedding (встраивание)",
     "unknown": "Не опознано",
 }
 SUBDIR = {
@@ -82,6 +138,7 @@ SUBDIR = {
     "lora_sd": "lora", "lora_qwen_image": "lora", "lora_z_image": "lora", "lora_flux": "lora",
     "animatediff_mm": "motion",
     "esrgan": "esrgan",
+    "embedding": "embeddings",
     "unknown": "unknown",
 }
 NEEDS = {
@@ -90,7 +147,7 @@ NEEDS = {
     "sd15": ["full_sd15"],
     "sdxl": ["full_sdxl"],
 }
-SCAN_EXT = (".safetensors", ".gguf", ".pth")
+SCAN_EXT = (".safetensors", ".gguf", ".pth", ".pt")
 DOWNLOADS: dict[str, dict] = {}
 
 # ==================== ОЧЕРЕДЬ ====================
@@ -99,8 +156,20 @@ QUEUE_LOCK = threading.Lock()
 CURRENT_PROC: subprocess.Popen | None = None
 JOB_COUNTER = 0
 LAST_ROLES: dict = {}
+LAST_FILES: list[dict] = []
 LORA_TRIGGERS: dict[str, list[str]] = {}
+CIV_CACHE_FILE = SD_CCPP_ROOT / "civitai_cache.json"
+CIV_CACHE: dict[str, dict] = {}
+CIV_TOKEN_FILE = SD_CCPP_ROOT / "civitai_token.txt"
+CIV_TOKEN = CIV_TOKEN_FILE.read_text(encoding="utf-8").strip() if CIV_TOKEN_FILE.exists() else ""
+WC_YAML: dict[str, list[tuple[float, str]]] = {}
+WC_ERRORS: list[str] = []
 # =================================================================
+
+
+def _out(name: str) -> str:
+    """Путь в output\\ (для -o и -i аргументов sd-cli)."""
+    return str(OUTPUT_DIR / name)
 
 
 def read_keys(path: Path) -> tuple[list[str], bool]:
@@ -191,8 +260,296 @@ def lora_family(path: Path, keys: list[str], name: str) -> str:
     return ""
 
 
+# ==================== WILDCARDS ====================
+def wc_map() -> dict[str, Path]:
+    if not WILDCARD_DIR.exists():
+        return {}
+    return {p.stem: p for p in sorted(WILDCARD_DIR.rglob("*.txt"))}
+
+
+def _wc_parse_block(raw: str) -> list[tuple[float, str]]:
+    raw = raw.strip()
+    if raw.startswith("{"):
+        raw = raw[1:]
+    if raw.endswith("}"):
+        raw = raw[:-1]
+    raw = raw.strip()
+    if re.match(r"^\d+\$\$", raw):
+        raw = re.sub(r"^\d+\$\$", "", raw).strip()
+        return [(1.0, p.strip()) for p in raw.split("|") if p.strip()]
+    if re.search(r"[\d.]+::", raw):
+        opts: list[tuple[float, str]] = []
+        for part in re.split(r"\s*\|\s*(?=[\d.]+::)", raw):
+            m = re.match(r"^([\d.]+)::(.*)$", part.strip(), flags=re.S)
+            if m:
+                w = float(m.group(1))
+                t = m.group(2).strip()
+                if w > 0 and t:
+                    opts.append((w, t))
+        return opts
+    return [(1.0, raw)] if raw else []
+
+
+def wc_load_yaml() -> None:
+    WC_YAML.clear()
+    if not WILDCARD_DIR.exists():
+        return
+    for p in sorted(WILDCARD_DIR.rglob("*.yaml")):
+        lines = p.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+        root = group = leaf = ""
+        i = 0
+        while i < len(lines):
+            s = lines[i].rstrip().strip()
+            i += 1
+            if not s or s.startswith("#") or s == "---":
+                continue
+            mk = re.match(r"^([A-Za-z0-9_\-]+):\s*$", s)
+            if mk:
+                key = mk.group(1)
+                j = i
+                while j < len(lines) and (not lines[j].strip() or lines[j].strip().startswith("#")):
+                    j += 1
+                nxt = lines[j].strip() if j < len(lines) else ""
+                if nxt.startswith("- "):
+                    leaf = key
+                elif not root:
+                    root = key
+                else:
+                    group, leaf = key, ""
+                continue
+            if s.startswith('- "'):
+                buf = [s[2:]]
+                while not buf[-1].rstrip().endswith('"') and i < len(lines):
+                    buf.append(lines[i].rstrip())
+                    i += 1
+                raw = "\n".join(buf)
+                if raw.rstrip().endswith('"'):
+                    raw = raw.rstrip()[:-1]
+                opts = _wc_parse_block(raw)
+                if opts and (root or group or leaf):
+                    WC_YAML["/".join(x for x in (root, group, leaf) if x)] = opts
+
+
+def wc_pick(name: str) -> str | None:
+    opts = WC_YAML.get(name)
+    if opts is None:
+        low = name.lower()
+        cand = [k for k in WC_YAML if k.split("/")[-1].lower() == low]
+        if len(cand) == 1:
+            opts = WC_YAML[cand[0]]
+    if not opts:
+        return None
+    texts = [t for _, t in opts]
+    weights = [w for w, _ in opts]
+    return random.choices(texts, weights=weights)[0]
+
+
+def wc_validate() -> None:
+    WC_ERRORS.clear()
+    wm = wc_map()
+    all_names = set(wm) | set(WC_YAML)
+    paths = []
+    if WILDCARD_DIR.exists():
+        paths = sorted(list(WILDCARD_DIR.rglob("*.txt")) + list(WILDCARD_DIR.rglob("*.yaml")))
+    for p in paths:
+        text = p.read_text(encoding="utf-8-sig", errors="ignore")
+        depth = 0
+        for i, c in enumerate(text):
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            if depth < 0:
+                WC_ERRORS.append(f"{p.name}: лишняя '}}' в позиции {i}")
+                break
+        if depth > 0:
+            WC_ERRORS.append(f"{p.name}: не закрыто {depth} '{{'")
+        refs = re.findall(r"__([\w\-/ ]+?)__", text)
+        for ref in refs:
+            if ref not in all_names:
+                WC_ERRORS.append(f"{p.name}: ссылка __{ref}__ не найдена")
+
+
+def expand_wildcards(text: str, depth: int = 0) -> tuple[str, list[str]]:
+    used: list[str] = []
+    if depth > 3 or "__" not in text:
+        return text, used
+    wm = wc_map()
+
+    def repl(m: re.Match) -> str:
+        name = m.group(1)
+        pick = wc_pick(name)
+        if pick is None:
+            p = wm.get(name)
+            if p is None:
+                return m.group(0)
+            lines = [l.strip() for l in p.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+                     if l.strip() and not l.strip().startswith("#")]
+            if not lines:
+                return m.group(0)
+            pick = random.choice(lines)
+        pick = re.sub(r"\s+", " ", pick).replace("BREAK", " ").strip()
+        used.append(f"wildcard {name} -> {pick[:80]}")
+        return pick
+
+    text = re.sub(r"__([\w\-/ ]+?)__", repl, text)
+    text = re.sub(r"\{([^{}\n]+)\}", lambda mm: random.choice(mm.group(1).split("|")).strip(), text)
+    if "__" in text and depth < 3:
+        text2, used2 = expand_wildcards(text, depth + 1)
+        return text2, used + used2
+    return text, used
+
+
+# ==================== ПОМОЩНИК ПРОМПТОВ ====================
+def _clean_ai_prompt(text: str) -> str:
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for p in parts:
+        key = p.lower()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= 2:
+            out.append(p)
+        if len(out) >= 45:
+            break
+    return ", ".join(out)
+
+
+def craft_prompt(base: str, mode: str, genre: str = "portrait") -> dict:
+    if mode == "template":
+        g = GENRES.get(genre, GENRES["portrait"])
+        return {"prompt": g["base"], "source": f"шаблон: {g['ru']}"}
+
+    if mode == "random":
+        g = GENRES.get(genre, GENRES["portrait"])
+        parts: list[str] = []
+        for mod in g["mods"]:
+            pick = wc_pick(mod)
+            if pick:
+                parts.append(pick)
+        parts.append(g["base"])
+        prompt = ", ".join(parts)
+        prompt, _ = expand_wildcards(prompt)
+        prompt = re.sub(r"\s+", " ", prompt).strip()
+        return {"prompt": prompt, "source": f"случайный шедевр: {g['ru']}"}
+
+    if mode == "ai":
+        sys_msg = ("Ты — эксперт по промптам для Stable Diffusion. "
+                   "Превращай короткие описания пользователя в подробные SD-промпты. "
+                   "Добавляй детали про освещение, стиль, композицию, камеру, атмосферу. "
+                   "Пиши только теги через запятую на английском, без комментариев. "
+                   "Используй веса (tag:1.3) для важных элементов. "
+                   "Не используй BREAK, не пиши объяснений. "
+                   "Не повторяй один тег дважды. "
+                   "Ограничься ~40 словами.")
+        payload = json.dumps({
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": base.strip() or DEFAULT_PROMPT},
+            ],
+            "temperature": 0.6, "max_tokens": 400,
+            "repeat_penalty": 1.25,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.3,
+        }).encode()
+        req = urllib.request.Request(LLAMA_API, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                data = json.loads(r.read())
+            text = data["choices"][0]["message"]["content"].strip()
+            text = re.sub(r"\s+", " ", text).strip()
+            return {"prompt": _clean_ai_prompt(text), "source": "улучшено локальным LLM"}
+        except Exception as e:
+            return {"prompt": base, "source": f"LLM недоступен: {e}"}
+
+    return {"prompt": base, "source": "как есть"}
+# =================================================================
+
+
+def civ_load_cache() -> None:
+    global CIV_CACHE
+    if CIV_CACHE_FILE.exists():
+        try:
+            data = json.loads(CIV_CACHE_FILE.read_text(encoding="utf-8"))
+            CIV_CACHE = {k: v for k, v in data.items() if "." in k}
+        except Exception:
+            CIV_CACHE = {}
+
+
+def civ_save_cache() -> None:
+    CIV_CACHE_FILE.write_text(json.dumps(CIV_CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+CIV_HOSTS = ["https://civitai.com", "https://civitai.red"]
+
+
+def _civ_api(query: str) -> dict:
+    last_err: Exception | None = None
+    for host in CIV_HOSTS:
+        req = urllib.request.Request(host + "/api/v1/" + query)
+        if CIV_TOKEN:
+            req.add_header("Authorization", f"Bearer {CIV_TOKEN}")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
+def civ_query(name: str) -> list[str]:
+    stem = Path(name).stem
+    q = re.sub(r"[_\-\.]+", " ", stem)
+    q = re.sub(r"\b(v\d+|fp\d+|bf16|f16|q\d_\w+|\d+)\b", " ", q, flags=re.I)
+    q = " ".join(q.split())[:60]
+    data = _civ_api("models?query=" + urllib.parse.quote(q) + "&types=LoRA&limit=5")
+    for item in data.get("items", []):
+        for ver in item.get("modelVersions", []):
+            files = [f.get("name", "") for f in ver.get("files", [])]
+            if any(Path(f).stem == stem for f in files):
+                return ver.get("trainedWords", []) or []
+    for item in data.get("items", []):
+        for ver in item.get("modelVersions", []):
+            if ver.get("trainedWords"):
+                return ver["trainedWords"]
+    return []
+
+
+def civ_enrich() -> dict:
+    if not LAST_FILES:
+        scan()
+    loras = [f["name"] for f in LAST_FILES if f["role"].startswith("lora")]
+    report: dict = {"total": len(loras), "api": "ok",
+                    "skipped_meta": 0, "cached": 0, "queried": {}}
+    try:
+        _civ_api("models?limit=1")
+    except Exception as e:
+        report["api"] = f"ошибка: {e}"
+    for fname in loras:
+        if LORA_TRIGGERS.get(fname):
+            report["skipped_meta"] += 1
+            continue
+        if fname in CIV_CACHE:
+            report["cached"] += 1
+            continue
+        if not str(report["api"]).startswith("ok"):
+            report["queried"][fname] = "пропущено: API недоступен"
+            break
+        try:
+            words = civ_query(fname)
+        except Exception as e:
+            words = []
+            report["queried"][fname] = f"ошибка: {e}"
+        else:
+            report["queried"][fname] = words
+        CIV_CACHE.setdefault(fname, {})["words"] = words
+        time.sleep(1)
+    civ_save_cache()
+    return report
+
+
 def classify_by_tensors(s: str) -> str:
-    """Роль по именам тензоров — главный источник правды."""
     if any(t in s for t in ("lora_up", "lora_down", "lora_A", "lora_B", "lokr")):
         if "transformer_blocks" in s and "double_blocks" not in s:
             return "lora_qwen_image"
@@ -221,8 +578,6 @@ def classify_by_tensors(s: str) -> str:
 
 
 def classify(keys: list[str], name: str, is_gguf: bool) -> str:
-    """СНАЧАЛА проверка «это лора?» по тензорам (иначе лоры с именами krea/z_image
-    притворяются DiT-ами), потом именны́е правила для полных моделей, потом тензоры."""
     low = name.lower()
     s = " | ".join(keys[:3000]) if keys else ""
     if any(t in s for t in ("lora_up", "lora_down", "lora_A", "lora_B", "lokr")):
@@ -253,6 +608,8 @@ def classify(keys: list[str], name: str, is_gguf: bool) -> str:
             return role
     if "esrgan" in low or "realesrgan" in low:
         return "esrgan"
+    if low.endswith(".pt"):
+        return "embedding"
     if is_gguf:
         if "mmproj" in low:
             return "llm_vision"
@@ -280,16 +637,16 @@ def analyze_file(path: Path) -> dict:
 
 
 def expected_path(role: str) -> Path:
-    """Куда ляжет недостающий файл, когда ты его скачаешь."""
     if role not in SOURCES:
         return MODELS / SUBDIR.get(role, "unknown") / f"<файл роли {role}>"
     return MODELS / SUBDIR[role] / SOURCES[role].rstrip("/").split("/")[-1]
 
 
 def build_one(pipeline: str, ckpt_rel: str, lora_names: list, mode: str, roles: dict,
-              custom_prompt: str = "", auto: bool = True) -> dict:
-    """Собирает ОДНУ команду; имена файлов включают модель и лоры; авто-добавки в промпт."""
-    neg = '-n "blurry, low quality, deformed"'
+              custom_prompt: str = "", auto: bool = True, emb_rels: list | None = None) -> dict:
+    """Собирает ОДНУ команду; ВСЕ выходные и входные файлы — в OUTPUT_DIR."""
+    emb_rels = emb_rels or []
+    neg = f'-n "{NEG.get(pipeline, NEG["sd15"])}"'
     prompt = custom_prompt.strip() or DEFAULT_PROMPT
     added = []
     if auto:
@@ -306,22 +663,35 @@ def build_one(pipeline: str, ckpt_rel: str, lora_names: list, mode: str, roles: 
                     break
             if words is None and LORA_TRIGGERS.get(l):
                 words, src = ", ".join(LORA_TRIGGERS[l]), "метаданные"
+            if words is None and CIV_CACHE.get(l, {}).get("words"):
+                words, src = ", ".join(CIV_CACHE[l]["words"]), "civitai"
             if words:
                 prompt += ", " + words
                 added.append(f"{Path(l).stem} [{src}]: {words}")
+    prompt, wused = expand_wildcards(prompt)
+    prompt = re.sub(r"\s+", " ", prompt).strip()
+    added.extend(wused)
     la, pl = "", prompt
     if lora_names:
         la = f' --lora-model-dir "{LORA_DIR}"'
         for l in lora_names:
             pl += f" <lora:{Path(l).stem}:1.0>"
+    ea = ""
+    if emb_rels:
+        ea = f' --embd-dir "{MODELS / "embeddings"}"'
+        for r in emb_rels:
+            pl += f" {Path(r).stem}"
+            added.append(f"embedding: {Path(r).stem}")
     stem = Path(ckpt_rel).stem if ckpt_rel else "base"
     ltag = "_" + "+".join(Path(l).stem for l in lora_names) if lora_names else ""
     img_name = f"{stem}{ltag}_img.png"
+    img_path = _out(img_name)
 
     if mode == "upscale":
         esr = str(MODELS / roles["esrgan"]["rel"]) if "esrgan" in roles else str(expected_path("esrgan"))
+        up_name = f"{stem}{ltag}_img_4x.png"
         return {"name": f"UPSCALE · x4 {img_name}", "added": added,
-                "cmd": f'{SD_CLI} -M upscale -i "{img_name}" --upscale-model "{esr}" -o "{stem}{ltag}_img_4x.png"'}
+                "cmd": f'{SD_CLI} -M upscale -i "{img_path}" --upscale-model "{esr}" -o "{_out(up_name)}"'}
 
     if pipeline == "qwen":
         dit = str(MODELS / ckpt_rel) if ckpt_rel else str(expected_path("dit_qwen_image"))
@@ -329,51 +699,53 @@ def build_one(pipeline: str, ckpt_rel: str, lora_names: list, mode: str, roles: 
         vae = str(MODELS / roles["vae_qwen"]["rel"]) if "vae_qwen" in roles else str(expected_path("vae_qwen"))
         return {"name": f"QWEN · Картинка · {stem}{ltag}", "added": added,
                 "cmd": f'{SD_CLI} --diffusion-model "{dit}" --llm "{llm}" --vae "{vae}"{la} '
-                       f'-p "{pl}" {neg} --steps 20 -W 512 -H 512 -o "{img_name}"'}
+                       f'-p "{pl}" {neg} --steps 20 --cfg-scale 4.0 -W 512 -H 512 -o "{img_path}"'}
 
     if pipeline == "zimage":
         dit = str(MODELS / ckpt_rel) if ckpt_rel else str(expected_path("dit_z_image"))
         if "krea" in stem.lower():
-            # Krea2 — всё-в-одном: LLM и VAE встроены в чекпоинт, снаружи не подаём
             return {"name": f"KREA2 · Картинка · {stem}{ltag} · 8 шагов", "added": added,
                     "cmd": f'{SD_CLI} --diffusion-model "{dit}"{la} -p "{pl}" {neg} '
-                           f'--steps 8 -W 1024 -H 1024 -o "{img_name}"'}
+                           f'--steps 8 --cfg-scale 1.0 -W 1024 -H 1024 -o "{img_path}"'}
         llm = str(MODELS / roles["llm_zimage"]["rel"]) if "llm_zimage" in roles else str(expected_path("llm_zimage"))
         vae = str(MODELS / roles["vae_zimage"]["rel"]) if "vae_zimage" in roles else str(expected_path("vae_zimage"))
         return {"name": f"Z-IMAGE · Картинка · {stem}{ltag} · 8 шагов", "added": added,
                 "cmd": f'{SD_CLI} --diffusion-model "{dit}" --llm "{llm}" --vae "{vae}"{la} '
-                       f'-p "{pl}" {neg} --steps 8 -W 1024 -H 1024 -o "{img_name}"'}
+                       f'-p "{pl}" {neg} --steps 8 --cfg-scale 1.0 -W 1024 -H 1024 -o "{img_path}"'}
 
     m = f'-m "{MODELS / ckpt_rel}"'
     if pipeline == "sdxl":
         if mode == "hires":
+            hr_name = f"{stem}{ltag}_hires.png"
             return {"name": f"SDXL · hires · {stem}{ltag}", "added": added,
-                    "cmd": f'{SD_CLI} {m}{la} -p "{pl}" {neg} --steps 20 -W 1024 -H 1024 '
-                           f'--hires --hires-width 1920 --hires-height 1080 --hires-steps 10 -o "{stem}{ltag}_hires.png"'}
+                    "cmd": f'{SD_CLI} {m}{la}{ea} -p "{pl}" {neg} --steps 20 -W 1024 -H 1024 '
+                           f'--hires --hires-width 1920 --hires-height 1080 --hires-steps 10 -o "{_out(hr_name)}"'}
         return {"name": f"SDXL · Картинка · {stem}{ltag}", "added": added,
-                "cmd": f'{SD_CLI} {m}{la} -p "{pl}" {neg} --steps 20 -W 1024 -H 1024 -o "{img_name}"'}
+                "cmd": f'{SD_CLI} {m}{la}{ea} -p "{pl}" {neg} --steps 20 -W 1024 -H 1024 -o "{img_path}"'}
 
     if mode == "hires":
+        hr_name = f"{stem}{ltag}_hires.png"
         return {"name": f"SD1.5 · hires · {stem}{ltag}", "added": added,
-                "cmd": f'{SD_CLI} {m}{la} -p "{pl}" {neg} --steps 20 -W 512 -H 512 '
-                       f'--hires --hires-width 1366 --hires-height 768 --hires-steps 10 -o "{stem}{ltag}_hires.png"'}
+                "cmd": f'{SD_CLI} {m}{la}{ea} -p "{pl}" {neg} --steps 20 -W 512 -H 512 '
+                       f'--hires --hires-width 1366 --hires-height 768 --hires-steps 10 -o "{_out(hr_name)}"'}
     if mode in ("txt2vid", "img2vid") and "animatediff_mm" in roles:
         mm = f'--motion-module "{MODELS / roles["animatediff_mm"]["rel"]}"'
         if mode == "txt2vid":
+            tv_name = f"{stem}{ltag}_t2v.webm"
             return {"name": f"SD1.5 · ТЕКСТ→ВИДЕО · {stem}{ltag}", "added": added,
-                    "cmd": f'{SD_CLI} {m} -M vid_gen {mm} --video-frames 32 --fps 8 -p "{pl}" {neg} '
-                           f'--steps 12 -W 512 -H 512 -o "{stem}{ltag}_t2v.webm"'}
+                    "cmd": f'{SD_CLI} {m}{ea} -M vid_gen {mm} --video-frames 32 --fps 8 -p "{pl}" {neg} '
+                           f'--steps 12 -W 512 -H 512 -o "{_out(tv_name)}"'}
+        iv_name = f"{stem}{ltag}_i2v.webm"
         return {"name": f"SD1.5 · КАРТИНКА→ВИДЕО · {stem}{ltag}", "added": added,
-                "cmd": f'{SD_CLI} {m} -M vid_gen {mm} --video-frames 32 --fps 8 -i "{img_name}" --strength 0.7 '
-                       f'-p "{pl}" {neg} --steps 12 -W 512 -H 512 -o "{stem}{ltag}_i2v.webm"'}
+                "cmd": f'{SD_CLI} {m}{ea} -M vid_gen {mm} --video-frames 32 --fps 8 -i "{img_path}" --strength 0.5 '
+                       f'-p "{pl}" {neg} --steps 12 -W 512 -H 512 -o "{_out(iv_name)}"'}
     return {"name": f"SD1.5 · Картинка · {stem}{ltag}", "added": added,
-            "cmd": f'{SD_CLI} {m}{la} -p "{pl}" {neg} --steps 20 -W 512 -H 512 -o "{img_name}"'}
+            "cmd": f'{SD_CLI} {m}{la}{ea} -p "{pl}" {neg} --steps 20 -W 512 -H 512 -o "{img_path}"'}
 
 
 def build_all_cmds(files: list, roles: dict) -> list:
-    """Быстрый полный список команд для ВСЕХ найденных конвейеров."""
     out = []
-    neg = '-n "blurry, low quality, deformed"'
+    neg = f'-n "{NEG["sd15"]}"'
     prompt = DEFAULT_PROMPT
 
     def p(role: str) -> str:
@@ -390,42 +762,41 @@ def build_all_cmds(files: list, roles: dict) -> list:
             pr += f" <lora:{Path(l).stem}:1.0>"
         return args, pr
 
-    sd_loras = [f["name"] for f in files if f["role"] == "lora_sd"]
     qwen_loras = [f["name"] for f in files if f["role"] == "lora_qwen_image"]
     zimg_loras = [f["name"] for f in files if f["role"] == "lora_z_image"]
 
     if "full_sd15" in roles:
         m = f'-m "{p("full_sd15")}"'
         out.append({"name": "SD1.5 · Картинка · лёгкая · 512/15 · RAM ~3 ГБ",
-                    "cmd": f'{SD_CLI} {m} -p "{prompt}" {neg} --steps 15 -W 512 -H 512 -o out_light.png'})
+                    "cmd": f'{SD_CLI} {m} -p "{prompt}" {neg} --steps 15 -W 512 -H 512 -o "{_out("out_light.png")}"'})
         if "animatediff_mm" in roles:
             mm = f'--motion-module "{p("animatediff_mm")}"'
             out.append({"name": "SD1.5 · КАРТИНКА→ВИДЕО · из out_light.png · RAM ~5 ГБ",
-                        "cmd": f'{SD_CLI} {m} -M vid_gen {mm} --video-frames 32 --fps 8 -i out_light.png '
-                               f'--strength 0.7 -p "snow falls, soft light, camera slowly zooms" {neg} '
-                               f'--steps 12 -W 512 -H 512 -o video_i2v.webm'})
+                        "cmd": f'{SD_CLI} {m} -M vid_gen {mm} --video-frames 32 --fps 8 -i "{_out("out_light.png")}" '
+                               f'--strength 0.5 -p "snow falls, soft light, camera slowly zooms" {neg} '
+                               f'--steps 12 -W 512 -H 512 -o "{_out("video_i2v.webm")}"'})
 
     if "full_sdxl" in roles:
         m = f'-m "{p("full_sdxl")}"'
         out.append({"name": "SDXL · Картинка · лёгкая · 1024/15 · RAM ~8 ГБ",
-                    "cmd": f'{SD_CLI} {m} -p "{prompt}" {neg} --steps 15 -W 1024 -H 1024 -o out_light.png'})
+                    "cmd": f'{SD_CLI} {m} -p "{prompt}" {neg} --steps 15 -W 1024 -H 1024 -o "{_out("out_light.png")}"'})
 
     if "dit_qwen_image" in roles or qwen_loras:
         trio = (f'--diffusion-model "{p("dit_qwen_image")}" '
                 f'--llm "{p("llm_qwenvl")}" --vae "{p("vae_qwen")}"')
         out.append({"name": "QWEN · Картинка · лёгкая · 512/15 · RAM ~15 ГБ",
-                    "cmd": f'{SD_CLI} {trio} -p "{prompt}" {neg} --steps 15 -W 512 -H 512 -o out_light.png'})
+                    "cmd": f'{SD_CLI} {trio} -p "{prompt}" {neg} --steps 15 --cfg-scale 4.0 -W 512 -H 512 -o "{_out("out_light.png")}"'})
 
     if "dit_z_image" in roles or zimg_loras:
         trio = (f'--diffusion-model "{p("dit_z_image")}" '
                 f'--llm "{p("llm_zimage")}" --vae "{p("vae_zimage")}"')
         la, pl = lora_part(zimg_loras)
         out.append({"name": "Z-IMAGE · Картинка · 8 шагов · 1024 · RAM ~11.5 ГБ",
-                    "cmd": f'{SD_CLI} {trio}{la} -p "{pl}" {neg} --steps 8 -W 1024 -H 1024 -o zimage_out.png'})
+                    "cmd": f'{SD_CLI} {trio}{la} -p "{pl}" {neg} --steps 8 --cfg-scale 1.0 -W 1024 -H 1024 -o "{_out("zimage_out.png")}"'})
 
     esr = p("esrgan")
     out.append({"name": "UPSCALE · x4 лёгкой out_light.png · RAM ~1-2 ГБ",
-                "cmd": f'{SD_CLI} -M upscale -i out_light.png --upscale-model "{esr}" -o out_light_4x.png'})
+                "cmd": f'{SD_CLI} -M upscale -i "{_out("out_light.png")}" --upscale-model "{esr}" -o "{_out("out_light_4x.png")}"'})
     return out
 
 
@@ -433,11 +804,11 @@ RAM_TIPS = """ПАМЯТКА ПО RAM:
   - SD 1.5 512 ~ 3 ГБ, SDXL 1024 ~ 8 ГБ, Qwen ~ 15 ГБ, Z-Image GGUF Q8 ~ 11.5 ГБ
   - Krea2 — всё-в-одном (~13 ГБ): LLM и VAE встроены, снаружи не подаются
   - Очередь гоняет задачи ПОСЛЕДОВАТЕЛЬНО — драк за RAM нет
-  - Если впритык: закрой браузер, снижай разрешение, --vae-tiling"""
+  - Если впритык: закрой браузер, снижай разрешение, --vae-tiling
+  - ВСЕ КАРТИНКИ И ВИДЕО СОХРАНЯЮТСЯ В: output\\"""
 
 
 def read_metadata(image_path: str) -> str:
-    """Достаёт промпт из метаданных PNG через sd-cli -M metadata."""
     try:
         r = subprocess.run([SD_CLI_RAW, "-M", "metadata", "--image", image_path],
                            capture_output=True, timeout=120)
@@ -452,7 +823,6 @@ def read_metadata(image_path: str) -> str:
 
 
 def ask_vl(image_path: str) -> str:
-    """Просит Qwen2.5-VL (порт 8081) описать картинку как промпт."""
     b64 = base64.b64encode(Path(image_path).read_bytes()).decode()
     payload = json.dumps({
         "messages": [{"role": "user", "content": [
@@ -469,7 +839,6 @@ def ask_vl(image_path: str) -> str:
 
 # ==================== ОЧЕРЕДЬ: функции ====================
 def load_queue() -> None:
-    """Восстанавливает очередь из queue.json после перезапуска."""
     global JOB_COUNTER
     if not QUEUE_FILE.exists():
         return
@@ -516,7 +885,6 @@ def clear_done() -> str:
 
 
 def remove_job(job_id: int) -> str:
-    """Убирает из очереди задачу, которая ещё не бежит."""
     with QUEUE_LOCK:
         job = next((j for j in QUEUE if j["id"] == job_id), None)
         if job is None or job["status"] == "running":
@@ -527,7 +895,6 @@ def remove_job(job_id: int) -> str:
 
 
 def read_tail(job_id: int, n: int = 12) -> str:
-    """Хвост лога задачи без ANSI-цветов."""
     p = LOG_DIR / f"job_{job_id:03d}.log"
     if not p.exists():
         return "(лога пока нет)"
@@ -537,9 +904,9 @@ def read_tail(job_id: int, n: int = 12) -> str:
 
 
 def worker() -> None:
-    """Фоновый воркер: берёт задачи из очереди и гоняет их последовательно."""
     global CURRENT_PROC
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     while True:
         job = None
         with QUEUE_LOCK:
@@ -555,7 +922,7 @@ def worker() -> None:
         try:
             with open(log_path, "w", encoding="utf-8", errors="ignore") as lf:
                 proc = subprocess.Popen(job["cmd"], shell=True, stdout=lf, stderr=subprocess.STDOUT,
-                                        cwd=str(MODELS.parent))
+                                        cwd=str(SD_CCPP_ROOT))
                 CURRENT_PROC = proc
                 proc.wait()
                 job["status"] = "done" if proc.returncode == 0 else f"error {proc.returncode}"
@@ -567,10 +934,14 @@ def worker() -> None:
 
 
 def scan() -> dict:
-    global LAST_ROLES
+    global LAST_ROLES, LAST_FILES
     MODELS.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    wc_load_yaml()
+    wc_validate()
     files = [analyze_file(p) for p in sorted(MODELS.rglob("*"))
              if p.is_file() and p.suffix in SCAN_EXT]
+    LAST_FILES = files
     if not files:
         return {"files": [], "target": "empty", "missing": [], "commands": [], "options": {},
                 "command": f"# Папка {MODELS} пуста — положи модели и нажми ещё раз."}
@@ -584,6 +955,8 @@ def scan() -> dict:
     for f in files:
         if f["role"].startswith("lora"):
             t = extract_triggers(MODELS / f["rel"])
+            if not t and CIV_CACHE.get(f["name"], {}).get("words"):
+                t = CIV_CACHE[f["name"]]["words"]
             if t:
                 LORA_TRIGGERS[f["name"]] = t
                 triggers_opt[f["name"]] = t
@@ -619,10 +992,14 @@ def scan() -> dict:
         "lorasSd": [f["name"] for f in files if f["role"] == "lora_sd"],
         "lorasQwen": [f["name"] for f in files if f["role"] == "lora_qwen_image"],
         "lorasZimg": [f["name"] for f in files if f["role"] == "lora_z_image"],
+        "embeds": [f["rel"] for f in files if f["role"] == "embedding"],
+        "wildcards": sorted(set(list(wc_map()) + list(WC_YAML))),
+        "wcErrors": WC_ERRORS,
         "hasMM": "animatediff_mm" in roles,
         "hasEsr": "esrgan" in roles,
         "triggers": triggers_opt,
         "loraCompat": compat_opt,
+        "outputDir": str(OUTPUT_DIR),
     }
     commands = build_all_cmds(files, roles)
     return {"files": files, "target": target, "present": present,
@@ -631,7 +1008,6 @@ def scan() -> dict:
 
 
 def organize() -> list:
-    """Раскидывает ВСЕ файлы по папкам-ролям и лечит ошибочно разложенное."""
     moved = []
     for p in sorted(MODELS.rglob("*")):
         if not p.is_file() or p.suffix not in SCAN_EXT:
@@ -648,7 +1024,6 @@ def organize() -> list:
 
 
 def ask_llm(text: str) -> str:
-    """Просит локальный Qwen объяснить анализ человеческим языком."""
     payload = json.dumps({
         "messages": [
             {"role": "system", "content": "Ты — дворецкий моделей. Объясни по-русски в 3-4 предложениях, что найдено и чего не хватает."},
@@ -661,6 +1036,15 @@ def ask_llm(text: str) -> str:
         return json.loads(r.read())["choices"][0]["message"]["content"]
 
 
+# ==================== ТИХИЙ СЕРВЕР ====================
+class QuietServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        if sys.exc_info()[0] in (ConnectionAbortedError, ConnectionResetError,
+                                 BrokenPipeError, TimeoutError):
+            return
+        super().handle_error(request, client_address)
+
+
 HTML = """<!doctype html><html><head><meta charset='utf-8'><title>Model Concierge</title>
 <style>body{background:#1e1e1e;color:#ddd;font-family:Consolas,monospace;margin:20px}
 button{background:#333;color:#ddd;border:1px solid #555;padding:6px 12px;cursor:pointer;margin:2px}
@@ -668,9 +1052,11 @@ input,select{background:#111;color:#ddd;border:1px solid #555;padding:6px;font-f
 pre{background:#111;padding:10px;white-space:pre-wrap;overflow-wrap:anywhere}
 label{margin-right:10px}
 .miss{color:#f66}.ok{color:#6f6}.hdr{color:#6cf}.run{color:#fc6}</style></head><body>
-<h2>Model Concierge v3.17</h2>
+<h2>Model Concierge v3.27</h2>
 <button onclick='scan()'>Сканировать папку models</button>
 <button onclick='organize()'>Раскидать по папкам</button>
+<button onclick='civScan()'>🔎 Civitai триггеры</button>
+<button onclick='openOutput()'>📁 Папка output</button>
 <button onclick='explain()'>Объяснить через ИИ</button>
 <button onclick='showQueue()'>Очередь</button>
 <label><input type=checkbox id=auto onchange='toggleAuto()'> автообновление</label>
@@ -683,9 +1069,28 @@ label{margin-right:10px}
 <select id='mode'></select>
 <br>
 <input id='pr' size='90' value='a photo of a red-haired girl sitting on the snow in a pine forest'>
+<select id='genre'>
+  <option value=portrait>Портрет</option>
+  <option value=landscape>Пейзаж</option>
+  <option value=scifi>Sci-Fi</option>
+  <option value=fantasy>Фэнтези</option>
+  <option value=horror>Хоррор</option>
+  <option value=cyberpunk>Киберпанк</option>
+</select>
+<button onclick='craftPrompt("template")'>📝 Шаблон</button>
+<button onclick='craftPrompt("random")'>🎲 Случайный шедевр</button>
+<button onclick='craftPrompt("ai")'>✨ Улучшить через ИИ</button>
+<br>
 <div id='lorabox'></div>
+<div id='embbox'></div>
 <label><input type=checkbox id=autox checked> авто-добавки (качество + триггеры лор)</label>
 <button onclick='buildCmd()'>Собрать команду</button>
+<br><br>
+<span class='hdr'>🔖 ТРИГГЕРЫ ВРУЧНУЮ (Civitai через браузер):</span>
+<select id='civlora'></select>
+<button onclick='openCiv()'>🔗 страница лоры</button>
+<input id='civwords' size='70' placeholder='вставь сюда триггеры со страницы (через запятую)'>
+<button onclick='saveCiv()'>💾 в память</button>
 <br><br>
 <input id='img' placeholder='путь к картинке (png/jpg)' size='70'>
 <button onclick='guess()'>Узнать промпт</button>
@@ -701,6 +1106,40 @@ function toggleAuto(){
     window.autoTimer = setInterval(showQueue, 5000);
     showQueue();
   } else { clearInterval(window.autoTimer); }
+}
+function fillCivSelect(){
+  const o = window.opts || {};
+  const all = (o.lorasSd||[]).concat(o.lorasQwen||[]).concat(o.lorasZimg||[]);
+  document.getElementById('civlora').innerHTML =
+    all.map(l=>'<option>'+esc(l)+'</option>').join('') || '<option>(нет лор)</option>';
+}
+async function openCiv(){
+  const n = document.getElementById('civlora').value;
+  const q = encodeURIComponent(n.replace(/\\.safetensors$/,'').replace(/[_\\-\\.]+/g,' '));
+  window.open('https://civitai.red/models?query='+q, '_blank');
+}
+async function saveCiv(){
+  const n = document.getElementById('civlora').value;
+  const w = document.getElementById('civwords').value;
+  const d = await (await fetch('/api/civitai/manual',{method:'POST',
+    body:JSON.stringify({name:n, words:w})})).json();
+  document.getElementById('out').innerHTML =
+    '<span class="ok">Сохранено:</span> ' + esc(n) + ' -> ' + esc((d.words||[]).join(', ')) +
+    '\\nЖми «Сканировать», чтобы конструктор подхватил слова.';
+}
+async function openOutput(){
+  const path = (window.opts||{}).outputDir || '';
+  if(!path) return;
+  // file:// ссылки на Windows-пути не открываются в большинстве браузеров;
+  // копируем путь в буфер, чтобы пользователь вставил в Проводник
+  const ta = document.createElement('textarea');
+  ta.value = path;
+  document.body.appendChild(ta); ta.select();
+  try{ document.execCommand('copy'); }catch(e){}
+  document.body.removeChild(ta);
+  document.getElementById('out').innerHTML =
+    '<span class="ok">Скопировано в буфер:</span> ' + esc(path) +
+    '\\nОткрой Проводник (Win+E) и вставь (Ctrl+V) в адресную строку.';
 }
 function fillCons(){
   const p = document.getElementById('pipe').value;
@@ -729,12 +1168,26 @@ function fillCons(){
         (fam ? ' <span class="'+(bad?'miss':'ok')+'">'+fam.toUpperCase()+'</span>' : '')+
         (t ? ' <span class="ok">['+esc(t)+']</span>' : '') + '</label>';
     }).join('');
+  const embs = (p=='sd15'||p=='sdxl') ? (o.embeds||[]) : [];
+  document.getElementById('embbox').innerHTML =
+    embs.map(e => '<label><input type=checkbox class=emb value="'+esc(e)+'">🧬 '+esc(e.split(/[\\\\/]/).pop())+'</label>').join('');
+}
+async function craftPrompt(mode){
+  const base = document.getElementById('pr').value;
+  const genre = document.getElementById('genre').value;
+  document.getElementById('out').innerText = 'Готовлю промпт...';
+  const d = await (await fetch('/api/craft',{method:'POST',
+    body:JSON.stringify({base:base, mode:mode, genre:genre})})).json();
+  document.getElementById('pr').value = d.prompt || '';
+  document.getElementById('out').innerHTML =
+    '<span class="hdr">ИСТОЧНИК:</span> ' + esc(d.source || '?');
 }
 async function buildCmd(){
   const loras = [...document.querySelectorAll('.lora:checked')].map(c=>c.value);
+  const embs = [...document.querySelectorAll('.emb:checked')].map(c=>c.value);
   const body = {pipeline:document.getElementById('pipe').value,
                 ckpt:document.getElementById('ckpt').value,
-                mode:document.getElementById('mode').value, loras:loras,
+                mode:document.getElementById('mode').value, loras:loras, embs:embs,
                 prompt:document.getElementById('pr').value,
                 auto:document.getElementById('autox').checked};
   const d = await (await fetch('/api/build',{method:'POST',body:JSON.stringify(body)})).json();
@@ -758,7 +1211,9 @@ async function scan(){
     '<option value=qwen>QWEN</option>' +
     '<option value=zimage>Z-IMAGE</option>';
   fillCons();
-  let t = 'ЦЕЛЬ: ' + esc(d.target) + '\\n\\nНАЙДЕНО:\\n';
+  fillCivSelect();
+  let t = 'ЦЕЛЬ: ' + esc(d.target) + '\\n';
+  t += '<span class="hdr">ВЫХОДЫ (output):</span> ' + esc(d.options.outputDir||'') + '\\n\\nНАЙДЕНО:\\n';
   (d.files||[]).forEach(f => t += '  ' + esc(f.rel) + ' (' + f.size_gb + ' ГБ) -> ' + esc(f.role_ru) +
     (f.keys_head ? ' <span class="miss">(ключи: ' + esc(f.keys_head) + ')</span>' : '') + '\\n');
   t += '\\nНЕ ХВАТАЕТ:\\n';
@@ -766,9 +1221,38 @@ async function scan(){
   (d.missing||[]).forEach(m => t += '  <span class="miss">' + esc(m.role_ru) +
     (m.url ? '\\n    url: <a href="' + esc(m.url) + '" target="_blank" style="color:#6cf">' + esc(m.url.split('/').pop()) + '</a>' : '') +
     '\\n    положить в: ' + esc(m.put_to) + '</span>\\n');
+  const wc = (d.options||{}).wildcards||[];
+  if(wc.length)
+    t += '\\n<span class="hdr">WILDCARDS (пиши в промпте __имя__ или __XMods/...__):</span>\\n  ' +
+         esc(wc.slice(0,30).join(', ')) + (wc.length>30 ? '... (всего '+wc.length+')' : '') + '\\n';
+  if(((d.options||{}).wcErrors||[]).length)
+    t += '\\n<span class="miss">⚠️ ПРОБЛЕМЫ С WILDCARDS:</span>\\n' +
+         (d.options.wcErrors||[]).map(e=>'  ' + esc(e)).join('\\n') + '\\n';
   t += '\\n' + esc(d.ram_tips || '');
   document.getElementById('out').innerHTML = t;
   window.lastScan = JSON.stringify(d);
+}
+async function civScan(){
+  const out = document.getElementById('out');
+  out.innerText = 'Спрашиваю Civitai... (~1 сек на новую лору)';
+  try{
+    const d = await (await fetch('/api/civitai',{method:'POST'})).json();
+    const r = d.report || {};
+    let t = 'ОТЧЁТ CIVITAI:\\n';
+    t += '  API: ' + esc(String(r.api||'?')) + '\\n';
+    t += '  лор всего: ' + (r.total||0) +
+         ' | с триггерами из метаданных: ' + (r.skipped_meta||0) +
+         ' | уже в кэше: ' + (r.cached||0) + '\\n';
+    const q = r.queried || {};
+    t += '  опрошено сейчас: ' + Object.keys(q).length + '\\n';
+    for(const [k,v] of Object.entries(q))
+      t += '    ' + esc(k) + ': ' + (Array.isArray(v) ? (v.join(', ') || '(слов нет)') : esc(String(v))) + '\\n';
+    if(!Object.keys(q).length) t += '    (все лоры уже с триггерами или в кэше)\\n';
+    t += '\\nЖми «Сканировать», чтобы конструктор подхватил слова.';
+    out.innerHTML = t;
+  }catch(e){
+    out.innerHTML = 'ОШИБКА CIVITAI: ' + esc(String(e));
+  }
 }
 async function addCustom(){
   const n = document.getElementById('qname').value;
@@ -828,24 +1312,30 @@ async function guess(){
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _send(self, data: bytes, ctype: str) -> None:
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.end_headers()
+            self.wfile.write(data)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError):
+            pass
+
     def _json(self, obj):
-        data = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(data)
+        self._send(json.dumps(obj, ensure_ascii=False).encode(),
+                   "application/json; charset=utf-8")
 
     def do_GET(self):
         if self.path == "/api/downloads":
             return self._json(DOWNLOADS)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(HTML.encode())
+        self._send(HTML.encode(), "text/html; charset=utf-8")
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            body = {}
         try:
             if self.path == "/api/scan":
                 res = scan()
@@ -865,12 +1355,26 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     return self._json({"source": "none",
                                        "prompt": f"метаданных нет; VL-сервер на 8081 не отвечает: {e}"})
+            if self.path == "/api/craft":
+                return self._json(craft_prompt(body.get("base", ""),
+                                               body.get("mode", "template"),
+                                               body.get("genre", "portrait")))
+            if self.path == "/api/civitai/manual":
+                name = body.get("name", "")
+                words = [w.strip() for w in re.split(r"[,\n;]+", body.get("words", "")) if w.strip()]
+                if name:
+                    CIV_CACHE[name] = {"words": words, "src": "manual"}
+                    civ_save_cache()
+                return self._json({"words": words})
             if self.path == "/api/build":
                 if not LAST_ROLES:
                     scan()
                 return self._json(build_one(body.get("pipeline", "sd15"), body.get("ckpt", ""),
                                             body.get("loras", []), body.get("mode", "img"), LAST_ROLES,
-                                            body.get("prompt", ""), body.get("auto", True)))
+                                            body.get("prompt", ""), body.get("auto", True),
+                                            body.get("embs", [])))
+            if self.path == "/api/civitai":
+                return self._json({"report": civ_enrich()})
             if self.path == "/api/queue":
                 with QUEUE_LOCK:
                     jobs = [{k: j[k] for k in ("id", "name", "cmd", "status")} for j in QUEUE]
@@ -895,6 +1399,11 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     load_queue()
+    civ_load_cache()
+    wc_load_yaml()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=worker, daemon=True).start()
     print(f"Concierge на http://{HOST}:{PORT}, воркер очереди запущен")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    print(f"Все картинки/видео → {OUTPUT_DIR}")
+    QuietServer((HOST, PORT), Handler).serve_forever()
